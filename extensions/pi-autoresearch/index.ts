@@ -85,11 +85,19 @@ interface RunDetails {
   checksTimedOut: boolean;
   checksOutput: string;
   checksDuration: number;
+  /** Metrics parsed from METRIC lines in output. null if none found. */
+  parsedMetrics: Record<string, number> | null;
+  /** Primary metric value extracted from parsedMetrics (matching metricName). null if not found. */
+  parsedPrimary: number | null;
+  /** Name of the primary metric (for display) */
+  metricName: string;
+  metricUnit: string;
 }
 
 interface LogDetails {
   experiment: ExperimentResult;
   state: ExperimentState;
+  wallClockSeconds: number | null;
 }
 
 interface AutoresearchRuntime {
@@ -99,6 +107,7 @@ interface AutoresearchRuntime {
   experimentsThisSession: number;
   autoResumeTurns: number;
   lastRunChecks: { pass: boolean; output: string; duration: number } | null;
+  lastRunDuration: number | null;
   runningExperiment: { startedAt: number; command: string } | null;
   state: ExperimentState;
 }
@@ -175,6 +184,34 @@ const LogParams = Type.Object({
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Prefix for structured metric output lines: `METRIC name=value` */
+const METRIC_LINE_PREFIX = "METRIC";
+
+/**
+ * Parse structured METRIC lines from command output.
+ * Format: METRIC name=value (one per line)
+ * Example:
+ *   METRIC total_µs=15200
+ *   METRIC compile_µs=4200
+ *
+ * Names must be word chars, dots, or µ (rejects `=` and other specials).
+ * Values must be finite numbers (rejects Infinity, NaN, hex, etc.).
+ * Duplicate names: last occurrence wins (allows scripts to refine values).
+ * Returns a Map preserving insertion order of first occurrence per key.
+ */
+function parseMetricLines(output: string): Map<string, number> {
+  const metrics = new Map<string, number>();
+  const regex = new RegExp(`^${METRIC_LINE_PREFIX}\\s+([\\w.µ]+)=(\\S+)\\s*$`, "gm");
+  let match;
+  while ((match = regex.exec(output)) !== null) {
+    const value = Number(match[2]);
+    if (Number.isFinite(value)) {
+      metrics.set(match[1], value);
+    }
+  }
+  return metrics;
+}
 
 /** Format a number with comma-separated thousands: 15586 → "15,586" */
 function commas(n: number): string {
@@ -416,6 +453,7 @@ function createSessionRuntime(): AutoresearchRuntime {
     experimentsThisSession: 0,
     autoResumeTurns: 0,
     lastRunChecks: null,
+    lastRunDuration: null,
     runningExperiment: null,
     state: createExperimentState(),
   };
@@ -764,6 +802,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
   const reconstructState = (ctx: ExtensionContext) => {
     const runtime = getRuntime(ctx);
     runtime.lastRunChecks = null;
+    runtime.lastRunDuration = null;
     runtime.runningExperiment = null;
     runtime.lastAutoResumeTime = 0;
     runtime.experimentsThisSession = 0;
@@ -1215,6 +1254,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
     promptGuidelines: [
       "Use run_experiment instead of bash when running experiment commands — it handles timing and output capture automatically.",
       "After run_experiment, always call log_experiment to record the result.",
+      "If the benchmark script outputs structured METRIC lines (e.g. 'METRIC total_µs=15200'), run_experiment will parse them automatically and suggest exact values for log_experiment. Use these parsed values directly instead of extracting them manually from the output.",
     ],
     parameters: RunParams,
 
@@ -1433,6 +1473,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       });
 
       const durationSeconds = (Date.now() - t0) / 1000;
+      runtime.lastRunDuration = durationSeconds;
       const benchmarkPassed = exitCode === 0 && !timedOut;
 
       // Run backpressure checks if benchmark passed and checks file exists
@@ -1487,6 +1528,13 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         maxBytes: EXPERIMENT_MAX_BYTES,
       });
 
+      // Parse structured METRIC lines from output
+      const parsedMetricMap = parseMetricLines(output);
+      const parsedMetrics = parsedMetricMap.size > 0
+        ? Object.fromEntries(parsedMetricMap)
+        : null;
+      const parsedPrimary = parsedMetricMap.get(state.metricName) ?? null;
+
       const details: RunDetails = {
         command: params.command,
         exitCode,
@@ -1499,6 +1547,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         checksTimedOut,
         checksOutput: checksOutput.split("\n").slice(-80).join("\n"),
         checksDuration,
+        parsedMetrics,
+        parsedPrimary,
+        metricName: state.metricName,
+        metricUnit: state.metricUnit,
       };
 
       // Build LLM response
@@ -1524,6 +1576,26 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (state.bestMetric !== null) {
         text += `📊 Current best ${state.metricName}: ${formatNum(state.bestMetric, state.metricUnit)}\n`;
+      }
+
+      // Show parsed METRIC lines to the LLM
+      if (parsedMetrics) {
+        const secondary = Object.entries(parsedMetrics).filter(([k]) => k !== state.metricName);
+
+        // Human-readable summary
+        text += `\n📐 Parsed metrics:`;
+        if (parsedPrimary !== null) {
+          text += ` ★ ${state.metricName}=${formatNum(parsedPrimary, state.metricUnit)}`;
+        }
+        for (const [name, value] of secondary) {
+          // Infer unit from name suffix for display
+          const sm = state.secondaryMetrics.find((m) => m.name === name);
+          const unit = sm?.unit ?? "";
+          text += ` ${name}=${formatNum(value, unit)}`;
+        }
+
+        // Machine-ready values for log_experiment (raw numbers, not formatted)
+        text += `\nUse these values directly in log_experiment (metric: ${parsedPrimary ?? "?"}, metrics: {${secondary.map(([k, v]) => `"${k}": ${v}`).join(", ")}})\n`;
       }
 
       text += `\n${llmTruncation.content}`;
@@ -1614,9 +1686,15 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         return new Text(text, 0, 0);
       }
 
+      // Helper: format parsed primary metric suffix (empty string if not available)
+      const parsedSuffix = d.parsedPrimary !== null
+        ? theme.fg("accent", `, ${d.metricName}: ${formatNum(d.parsedPrimary, d.metricUnit)}`)
+        : "";
+
       if (d.checksTimedOut) {
         let text =
-          theme.fg("success", `✅ ${d.durationSeconds.toFixed(1)}s`) +
+          theme.fg("success", `✅ wall: ${d.durationSeconds.toFixed(1)}s`) +
+          parsedSuffix +
           theme.fg("error", ` ⏰ checks timeout ${d.checksDuration.toFixed(1)}s`);
         text = appendOutput(text, d.checksOutput);
         return new Text(text, 0, 0);
@@ -1624,21 +1702,27 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
 
       if (d.checksPass === false) {
         let text =
-          theme.fg("success", `✅ ${d.durationSeconds.toFixed(1)}s`) +
+          theme.fg("success", `✅ wall: ${d.durationSeconds.toFixed(1)}s`) +
+          parsedSuffix +
           theme.fg("error", ` 💥 checks failed ${d.checksDuration.toFixed(1)}s`);
         text = appendOutput(text, d.checksOutput);
         return new Text(text, 0, 0);
       }
 
       if (d.crashed) {
-        let text = theme.fg("error", `💥 FAIL exit=${d.exitCode} ${d.durationSeconds.toFixed(1)}s`);
+        let text = theme.fg("error", `💥 FAIL exit=${d.exitCode} ${d.durationSeconds.toFixed(1)}s`) + parsedSuffix;
         text = appendOutput(text, d.tailOutput);
         return new Text(text, 0, 0);
       }
 
-      let text =
-        theme.fg("success", "✅ ") +
-        theme.fg("accent", `${d.durationSeconds.toFixed(1)}s`);
+      let text = theme.fg("success", "✅ ");
+
+      // Show wall-clock and parsed primary metric together
+      const parts: string[] = [`wall: ${d.durationSeconds.toFixed(1)}s`];
+      if (d.parsedPrimary !== null) {
+        parts.push(`${d.metricName}: ${formatNum(d.parsedPrimary, d.metricUnit)}`);
+      }
+      text += theme.fg("accent", parts.join(", "));
 
       if (d.checksPass === true) {
         text += theme.fg("success", ` ✓ checks ${d.checksDuration.toFixed(1)}s`);
@@ -1876,8 +1960,10 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
       }
 
       // Clear running experiment and checks state (log_experiment consumes the run)
+      const wallClockSeconds = runtime.lastRunDuration;
       runtime.runningExperiment = null;
       runtime.lastRunChecks = null;
+      runtime.lastRunDuration = null;
 
       // Check if max experiments limit reached
       const limitReached = state.maxExperiments !== null && segmentCount >= state.maxExperiments;
@@ -1896,6 +1982,7 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         details: {
           experiment: { ...experiment, metrics: { ...experiment.metrics } },
           state: cloneExperimentState(state),
+          wallClockSeconds,
         } as LogDetails,
       };
     },
@@ -1934,14 +2021,32 @@ export default function autoresearchExtension(pi: ExtensionAPI) {
         theme.fg(color, `${icon} `) +
         theme.fg("accent", `#${s.results.length}`);
 
-
+      // Show wall-clock and primary metric together
+      const metricParts: string[] = [];
+      if (d.wallClockSeconds !== null && d.wallClockSeconds !== undefined) {
+        metricParts.push(`wall: ${d.wallClockSeconds.toFixed(1)}s`);
+      }
+      if (exp.metric > 0) {
+        metricParts.push(`${s.metricName}: ${formatNum(exp.metric, s.metricUnit)}`);
+      }
+      if (metricParts.length > 0) {
+        text += theme.fg("dim", " (") + theme.fg("warning", metricParts.join(theme.fg("dim", ", "))) + theme.fg("dim", ")");
+      }
 
       text += " " + theme.fg("muted", exp.description);
 
+      // Show best metric for context (overall best, not just this run)
       if (s.bestMetric !== null) {
+        // Find the actual best kept metric in the current segment
+        let best = s.bestMetric;
+        for (const r of s.results) {
+          if (r.segment === s.currentSegment && r.status === "keep" && r.metric > 0) {
+            if (isBetter(r.metric, best, s.bestDirection)) best = r.metric;
+          }
+        }
         text +=
           theme.fg("dim", " │ ") +
-          theme.fg("warning", theme.bold(`★ ${formatNum(s.bestMetric, s.metricUnit)}`));
+          theme.fg("warning", `★ best: ${formatNum(best, s.metricUnit)}`);
       }
 
       // Show secondary metrics inline

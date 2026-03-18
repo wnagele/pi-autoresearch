@@ -56,7 +56,7 @@ Update `autoresearch.md` periodically — especially the "What's Been Tried" sec
 
 ### `autoresearch.sh`
 
-Bash script (`set -euo pipefail`) that: pre-checks fast (syntax errors in <1s), runs the benchmark, outputs `METRIC name=number` lines. Keep it fast — every second is multiplied by hundreds of runs. Update it during the loop as needed.
+Bash script (`set -euo pipefail`) that: pre-checks fast (syntax errors in <1s), runs the benchmark, outputs `METRIC name=value` lines to stdout. These lines are automatically parsed by `run_experiment` — the primary metric (matching `init_experiment`'s `metric_name`) and any secondary metrics are extracted, shown in the TUI, and suggested as exact values for `log_experiment`. If no METRIC lines are found, the agent falls back to manually extracting values from the output. Keep the script fast — every second is multiplied by hundreds of runs. Update it during the loop as needed.
 
 ### `autoresearch.config.json` (optional)
 
